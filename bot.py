@@ -56,11 +56,11 @@ def fetch_latest_cves():
     return []
 
 def format_cve_message(cve):
-    cve_id = cve.get("id")
-    summary = cve.get("summary", "No description available.")
+    cve_id = cve.get("id") or cve.get("cve", {}).get("CVE_data_meta", {}).get("ID")
+    summary = cve.get("summary") or cve.get("description") or "No description available."
     published = cve.get("Published", "Unknown date")
     cvss = cve.get("cvss", "N/A")
-    references = cve.get("references", [])
+    references = cve.get("references", []) or []
     ref_text = "\n".join(references[:3])
     msg = (
         f"🚨 *New CVE Alert!*\n\n"
@@ -81,23 +81,24 @@ def main():
     subscribers = handle_start_commands(subscribers)
 
     latest_cves = fetch_latest_cves()
-   # Compare with last seen CVEs
-new_cves = []
-for cve in latest_cves:
-    cve_id = cve.get("id") or cve.get("cve", {}).get("id") or cve.get("cve", {}).get("CVE_data_meta", {}).get("ID")
-    if not cve_id:
-        print(f"[WARN] Skipping malformed CVE entry: {cve}")
-        continue
-    if cve_id not in last_seen:
-        new_cves.append({"id": cve_id, "description": cve.get("description", "No description available")})
 
-print(f"[INFO] Found {len(new_cves)} new CVEs to send.")
+    # Compare with last seen CVEs
+    new_cves = []
+    for cve in latest_cves:
+        cve_id = cve.get("id") or cve.get("cve", {}).get("CVE_data_meta", {}).get("ID")
+        if not cve_id:
+            print(f"[WARN] Skipping malformed CVE entry: {cve}")
+            continue
+        if cve_id not in last_seen:
+            new_cves.append(cve)
+
+    print(f"[INFO] Found {len(new_cves)} new CVEs to send.")
     if new_cves:
         for cve in new_cves:
             message = format_cve_message(cve)
             for chat_id in subscribers:
                 send_message(chat_id, message)
-        last_seen = [cve["id"] for cve in latest_cves[:50]]
+        last_seen = [cve.get("id") or cve.get("cve", {}).get("CVE_data_meta", {}).get("ID") for cve in latest_cves[:50]]
         print(f"Sent {len(new_cves)} new CVEs.")
     else:
         print("No new CVEs found.")
@@ -107,4 +108,3 @@ print(f"[INFO] Found {len(new_cves)} new CVEs to send.")
 
 if __name__ == "__main__":
     main()
-
