@@ -8,8 +8,9 @@ from typing import Any, Dict, List, Optional
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # Config - use environment variables where appropriate
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+# Note: workflow sets TELEGRAM_TOKEN in the Run step env, so we read that name here.
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}" if TELEGRAM_TOKEN else ""
 CVE_FEED = os.environ.get("CVE_FEED", "https://cve.circl.lu/api/last")
 LAST_SEEN_FILE = os.environ.get("LAST_SEEN_FILE", "last_seen.json")
 SUBSCRIBERS_FILE = os.environ.get("SUBSCRIBERS_FILE", "subscribers.json")
@@ -34,11 +35,9 @@ def save_json(path: str, data: Any) -> None:
 def extract_cve_id(cve: Dict[str, Any]) -> Optional[str]:
     if not isinstance(cve, dict):
         return None
-    # try common top-level keys
     for key in ("id", "ID"):
         if key in cve and isinstance(cve[key], str):
             return cve[key]
-    # nested structures
     nested = cve.get("cve", {})
     if isinstance(nested, dict):
         if "id" in nested and isinstance(nested["id"], str):
@@ -51,25 +50,21 @@ def extract_cve_id(cve: Dict[str, Any]) -> Optional[str]:
     return None
 
 def ref_to_str(ref: Any) -> str:
-    """Convert various reference shapes into a string suitable for display/joining."""
+    """Normalize reference entry into a printable string."""
     if isinstance(ref, str):
         return ref
     if isinstance(ref, dict):
-        # prefer common url keys
         for k in ("url", "href", "link"):
             v = ref.get(k)
             if isinstance(v, str):
                 return v
-        # fallback to title/name/text
         for k in ("name", "title", "text"):
             v = ref.get(k)
             if isinstance(v, str):
                 return v
-        # try any http-like value inside the dict
         for v in ref.values():
             if isinstance(v, str) and v.startswith("http"):
                 return v
-        # last resort: JSON representation
         try:
             return json.dumps(ref, ensure_ascii=False)
         except Exception:
@@ -78,8 +73,8 @@ def ref_to_str(ref: Any) -> str:
 
 # --- TELEGRAM HELPERS ---
 def send_message(chat_id: int, text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN not set, cannot send messages.")
+    if not TELEGRAM_TOKEN:
+        logging.error("TELEGRAM_TOKEN not set; cannot send messages.")
         return
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     try:
@@ -90,6 +85,8 @@ def send_message(chat_id: int, text: str) -> None:
         logging.error("Error sending message to %s: %s", chat_id, e)
 
 def get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
+    if not TELEGRAM_TOKEN:
+        return []
     params = {"offset": offset, "timeout": 10}
     try:
         resp = requests.get(f"{BASE_URL}/getUpdates", params=params, timeout=20)
@@ -114,7 +111,6 @@ def handle_start_commands(subscribers: List[int]) -> List[int]:
             logging.info("New subscriber: %s", chat_id)
             send_message(chat_id, "✅ You have been subscribed to CVE alerts! You'll get new vulnerabilities every 2 hours.")
     if last_update_id:
-        # Acknowledge processed updates by advancing offset
         try:
             requests.get(f"{BASE_URL}/getUpdates", params={"offset": last_update_id + 1}, timeout=5)
         except Exception:
@@ -139,26 +135,16 @@ def fetch_latest_cves() -> List[Dict[str, Any]]:
 
 def format_cve_message(cve: Dict[str, Any]) -> str:
     cve_id = extract_cve_id(cve) or cve.get("id") or "UNKNOWN"
-    summary = (
-        cve.get("summary")
-        or cve.get("description")
-        or (cve.get("cve", {}) or {}).get("description")
-        or "No description available."
-    )
+    summary = (cve.get("summary") or cve.get("description") or (cve.get("cve", {}) or {}).get("description") or "No description available.")
     published = cve.get("Published") or cve.get("published") or cve.get("publishedDate") or "Unknown date"
     cvss = cve.get("cvss") or cve.get("cvss_v3") or cve.get("cvss-score") or "N/A"
 
-    # gather references from common keys
     references_raw = cve.get("references") or cve.get("refs") or cve.get("references_data") or []
     if not isinstance(references_raw, list):
         references_raw = [references_raw]
-
     reference_strs = [ref_to_str(r) for r in references_raw if r]
     ref_texts = [r for r in reference_strs if r]
-    if not ref_texts:
-        ref_text = "No references available."
-    else:
-        ref_text = "\n".join(ref_texts[:3])
+    ref_text = "\n".join(ref_texts[:3]) if ref_texts else "No references available."
 
     msg = (
         f"🚨 *New CVE Alert!*\n\n"
@@ -196,7 +182,6 @@ def main() -> None:
             logging.warning("Skipping malformed CVE entry: %s", cve)
             continue
         if cve_id not in last_seen:
-            # keep the full CVE object so format_cve_message can access summary, references, published, etc.
             new_cves.append(cve)
 
     logging.info("Found %d new CVEs to send.", len(new_cves))
