@@ -1,41 +1,53 @@
-name: CVE Alert Bot
+steps:
+- name: Checkout repository
+  uses: actions/checkout@v4
+  with:
+    fetch-depth: 0                # full history so we can pull/rebase safely
+    persist-credentials: true
+    token: ${{ secrets.GITHUB_TOKEN }}
 
-permissions:
-  contents: write
+- name: Set up Python
+  uses: actions/setup-python@v5
+  with:
+    python-version: '3.10'
 
-on:
-  schedule:
-    - cron: '0 */2 * * *'
-  workflow_dispatch:
+- name: Install dependencies
+  run: pip install -r requirements.txt
 
-jobs:
-  run-bot:
-    runs-on: ubuntu-latest
+- name: Ensure data files exist
+  run: |
+    # Make sure files exist so git add/commit behave consistently
+    [ -f last_seen.json ] || echo "[]" > last_seen.json
+    [ -f subscribers.json ] || echo "[]" > subscribers.json
 
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        persist-credentials: true
-        token: ${{ secrets.GITHUB_TOKEN }}
+- name: Run bot
+  env:
+    TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+  run: python bot.py
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+- name: Commit updated files
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  run: |
+    set -e
 
-    - name: Install dependencies
-      run: pip install -r requirements.txt
+    git config user.name "github-actions[bot]"
+    git config user.email "github-actions[bot]@users.noreply.github.com"
 
-    - name: Run bot
-      env:
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      run: python bot.py
+    # Stage the files that the bot updates
+    git add last_seen.json subscribers.json || true
 
-    - name: Commit updated files
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add last_seen.json subscribers.json || true
-        git commit -m "Update CVE and subscriber data [bot]" || echo "No changes to commit"
-        git push
+    # Commit only if there are changes
+    git commit -m "Update CVE and subscriber data [bot]" || echo "No changes to commit"
+
+    # Derive branch name (works when running on refs/heads/*)
+    BRANCH="${GITHUB_REF#refs/heads/}"
+
+    # Fetch latest remote branch and rebase local commits on top.
+    # --autostash preserves local changes during rebase.
+    # Allow failures here to avoid aborting the workflow entirely; push will be attempted afterwards.
+    git pull --rebase --autostash origin "$BRANCH" || true
+
+    # Push local commits (if any). If push fails due to permission or non-fast-forward,
+    # print a message but don't fail the job (adjust as needed).
+    git push origin "$BRANCH" || echo "Push failed; remote may contain new commits or write permission missing"
