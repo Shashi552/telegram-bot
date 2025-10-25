@@ -1,67 +1,165 @@
+from __future__ import annotations
 import os
 import json
 import requests
-from datetime import datetime
+import logging
+from typing import Any, Dict, List, Optional
 
-# --- CONFIG ---
-BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-CVE_FEED = "https://cve.circl.lu/api/last"
-LAST_SEEN_FILE = "last_seen.json"
-SUBSCRIBERS_FILE = "subscribers.json"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# --- LOAD STATE FILES ---
-def load_json(filename, default):
+# Config - use environment variables where appropriate
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+CVE_FEED = os.environ.get("CVE_FEED", "https://cve.circl.lu/api/last")
+LAST_SEEN_FILE = os.environ.get("LAST_SEEN_FILE", "last_seen.json")
+SUBSCRIBERS_FILE = os.environ.get("SUBSCRIBERS_FILE", "subscribers.json")
+
+# --- Utilities ---
+def load_json(path: str, default: Any) -> Any:
     try:
-        with open(filename, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return default
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+    except Exception as e:
+        logging.warning("Failed to load %s: %s", path, e)
+    return default
 
-def save_json(filename, data):
-    with open(filename, "w") as f:
-        json.dump(data, f, indent=2)
+def save_json(path: str, data: Any) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logging.error("Failed to write %s: %s", path, e)
+
+def extract_cve_id(cve: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(cve, dict):
+        return None
+    # try common top-level keys
+    for key in ("id", "ID"):
+        if key in cve and isinstance(cve[key], str):
+            return cve[key]
+    # nested structures
+    nested = cve.get("cve", {})
+    if isinstance(nested, dict):
+        if "id" in nested and isinstance(nested["id"], str):
+            return nested["id"]
+        meta = nested.get("CVE_data_meta", {})
+        if isinstance(meta, dict):
+            cid = meta.get("ID") or meta.get("id")
+            if isinstance(cid, str):
+                return cid
+    return None
+
+def ref_to_str(ref: Any) -> str:
+    """Convert various reference shapes into a string suitable for display/joining."""
+    if isinstance(ref, str):
+        return ref
+    if isinstance(ref, dict):
+        # prefer common url keys
+        for k in ("url", "href", "link"):
+            v = ref.get(k)
+            if isinstance(v, str):
+                return v
+        # fallback to title/name/text
+        for k in ("name", "title", "text"):
+            v = ref.get(k)
+            if isinstance(v, str):
+                return v
+        # try any http-like value inside the dict
+        for v in ref.values():
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+        # last resort: JSON representation
+        try:
+            return json.dumps(ref, ensure_ascii=False)
+        except Exception:
+            return str(ref)
+    return str(ref)
 
 # --- TELEGRAM HELPERS ---
-def send_message(chat_id, text):
-    requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+def send_message(chat_id: int, text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        logging.error("TELEGRAM_BOT_TOKEN not set, cannot send messages.")
+        return
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    try:
+        resp = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
+        if resp.status_code != 200:
+            logging.error("Failed to send message to %s: %s %s", chat_id, resp.status_code, resp.text)
+    except Exception as e:
+        logging.error("Error sending message to %s: %s", chat_id, e)
 
-def get_updates(offset=None):
+def get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
     params = {"offset": offset, "timeout": 10}
-    resp = requests.get(f"{BASE_URL}/getUpdates", params=params).json()
-    return resp.get("result", [])
+    try:
+        resp = requests.get(f"{BASE_URL}/getUpdates", params=params, timeout=20)
+        data = resp.json()
+        return data.get("result", [])
+    except Exception as e:
+        logging.warning("get_updates error: %s", e)
+    return []
 
 # --- HANDLE NEW SUBSCRIBERS ---
-def handle_start_commands(subscribers):
-    print("Checking for /start commands...")
+def handle_start_commands(subscribers: List[int]) -> List[int]:
+    logging.info("Checking for /start commands...")
     last_update_id = None
     updates = get_updates()
     for update in updates:
-        last_update_id = update["update_id"]
+        last_update_id = update.get("update_id")
         message = update.get("message", {})
         text = message.get("text", "")
         chat_id = message.get("chat", {}).get("id")
-        if text == "/start" and chat_id not in subscribers:
+        if text == "/start" and chat_id and chat_id not in subscribers:
             subscribers.append(chat_id)
+            logging.info("New subscriber: %s", chat_id)
             send_message(chat_id, "✅ You have been subscribed to CVE alerts! You'll get new vulnerabilities every 2 hours.")
     if last_update_id:
-        requests.get(f"{BASE_URL}/getUpdates", params={"offset": last_update_id + 1})
+        # Acknowledge processed updates by advancing offset
+        try:
+            requests.get(f"{BASE_URL}/getUpdates", params={"offset": last_update_id + 1}, timeout=5)
+        except Exception:
+            pass
     return subscribers
 
 # --- FETCH & SEND CVES ---
-def fetch_latest_cves():
-    resp = requests.get(CVE_FEED)
-    if resp.status_code == 200:
-        return resp.json()
+def fetch_latest_cves() -> List[Dict[str, Any]]:
+    try:
+        resp = requests.get(CVE_FEED, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for k in ("results", "items", "cves"):
+                    if k in data and isinstance(data[k], list):
+                        return data[k]
+    except Exception as e:
+        logging.error("Failed to fetch CVE feed: %s", e)
     return []
 
-def format_cve_message(cve):
-    cve_id = cve.get("id") or cve.get("cve", {}).get("CVE_data_meta", {}).get("ID")
-    summary = cve.get("summary") or cve.get("description") or "No description available."
-    published = cve.get("Published", "Unknown date")
-    cvss = cve.get("cvss", "N/A")
-    references = cve.get("references", []) or []
-    ref_text = "\n".join(references[:3])
+def format_cve_message(cve: Dict[str, Any]) -> str:
+    cve_id = extract_cve_id(cve) or cve.get("id") or "UNKNOWN"
+    summary = (
+        cve.get("summary")
+        or cve.get("description")
+        or (cve.get("cve", {}) or {}).get("description")
+        or "No description available."
+    )
+    published = cve.get("Published") or cve.get("published") or cve.get("publishedDate") or "Unknown date"
+    cvss = cve.get("cvss") or cve.get("cvss_v3") or cve.get("cvss-score") or "N/A"
+
+    # gather references from common keys
+    references_raw = cve.get("references") or cve.get("refs") or cve.get("references_data") or []
+    if not isinstance(references_raw, list):
+        references_raw = [references_raw]
+
+    reference_strs = [ref_to_str(r) for r in references_raw if r]
+    ref_texts = [r for r in reference_strs if r]
+    if not ref_texts:
+        ref_text = "No references available."
+    else:
+        ref_text = "\n".join(ref_texts[:3])
+
     msg = (
         f"🚨 *New CVE Alert!*\n\n"
         f"*ID:* `{cve_id}`\n"
@@ -74,37 +172,54 @@ def format_cve_message(cve):
     return msg
 
 # --- MAIN LOGIC ---
-def main():
+def main() -> None:
     last_seen = load_json(LAST_SEEN_FILE, [])
+    if not isinstance(last_seen, list):
+        last_seen = []
+
     subscribers = load_json(SUBSCRIBERS_FILE, [])
+    if not isinstance(subscribers, list):
+        subscribers = []
 
     subscribers = handle_start_commands(subscribers)
+    save_json(SUBSCRIBERS_FILE, subscribers)
 
     latest_cves = fetch_latest_cves()
+    if not latest_cves:
+        logging.info("No CVEs fetched.")
+        return
 
-    # Compare with last seen CVEs
-    new_cves = []
+    new_cves: List[Dict[str, Any]] = []
     for cve in latest_cves:
-        cve_id = cve.get("id") or cve.get("cve", {}).get("CVE_data_meta", {}).get("ID")
+        cve_id = extract_cve_id(cve)
         if not cve_id:
-            print(f"[WARN] Skipping malformed CVE entry: {cve}")
+            logging.warning("Skipping malformed CVE entry: %s", cve)
             continue
         if cve_id not in last_seen:
+            # keep the full CVE object so format_cve_message can access summary, references, published, etc.
             new_cves.append(cve)
 
-    print(f"[INFO] Found {len(new_cves)} new CVEs to send.")
+    logging.info("Found %d new CVEs to send.", len(new_cves))
+
     if new_cves:
         for cve in new_cves:
             message = format_cve_message(cve)
             for chat_id in subscribers:
-                send_message(chat_id, message)
-        last_seen = [cve.get("id") or cve.get("cve", {}).get("CVE_data_meta", {}).get("ID") for cve in latest_cves[:50]]
-        print(f"Sent {len(new_cves)} new CVEs.")
-    else:
-        print("No new CVEs found.")
+                try:
+                    send_message(chat_id, message)
+                except Exception as e:
+                    logging.error("Failed to send CVE to %s: %s", chat_id, e)
 
-    save_json(LAST_SEEN_FILE, last_seen)
-    save_json(SUBSCRIBERS_FILE, subscribers)
+        # Update last_seen to the most recent 50 ids from latest_cves in order
+        updated_ids: List[str] = []
+        for cve in latest_cves:
+            cid = extract_cve_id(cve)
+            if cid:
+                updated_ids.append(cid)
+            if len(updated_ids) >= 50:
+                break
+        save_json(LAST_SEEN_FILE, updated_ids)
+        logging.info("Updated last_seen with %d IDs.", len(updated_ids))
 
 if __name__ == "__main__":
     main()
