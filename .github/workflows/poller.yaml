@@ -5,7 +5,7 @@ permissions:
 
 on:
   schedule:
-    - cron: '*/1 * * * *'   # every minute (UTC) — adjust as needed
+    - cron: '*/1 * * * *'   # every minute (UTC)
   workflow_dispatch:
 
 concurrency:
@@ -18,82 +18,74 @@ jobs:
     timeout-minutes: 6
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        persist-credentials: true
-        token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Install dependencies
-      run: |
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-    - name: Load bot state from bot-data branch (if exists)
-      id: load_state
-      run: |
-        # If bot-data branch exists in remote, extract state.json; otherwise create default
-        if git ls-remote --exit-code --heads origin bot-data >/dev/null 2>&1; then
-          echo "bot-data exists; extracting state.json (if present)"
-          if git show origin/bot-data:state.json > state.json 2>/dev/null; then
-            echo "Loaded state.json from bot-data"
+      - name: Load bot state from bot-data branch (if exists)
+        id: load_state
+        run: |
+          if git ls-remote --exit-code --heads origin bot-data >/dev/null 2>&1; then
+            echo "bot-data exists; extracting state.json (if present)"
+            if git show origin/bot-data:state.json > state.json 2>/dev/null; then
+              echo "Loaded state.json from bot-data"
+            else
+              echo "{}" > state.json
+              echo "No state.json in bot-data; created empty state.json"
+            fi
           else
-            echo "{}" > state.json
-            echo "No state.json in bot-data; created empty state.json"
-          fi
-        else
-          echo "bot-data branch not found; creating default state.json"
-          cat > state.json <<'EOF'
+            echo "bot-data branch not found; creating default state.json"
+            cat > state.json <<'EOF'
 {"offset": null, "last_seen": [], "last_cve_ts": 0, "subscribers": []}
 EOF
-        fi
-        ls -l state.json
-        cat state.json || true
+          fi
+          ls -l state.json
+          cat state.json || true
 
-    - name: Run bot (single-pass)
-      env:
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        STATE_FILE: state.json
-        DIGEST_INTERVAL_SECONDS: ${{ env.DIGEST_INTERVAL_SECONDS || '7200' }}
-      run: |
-        python bot.py --once
+      - name: Run bot (single-pass)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          STATE_FILE: state.json
+          DIGEST_INTERVAL_SECONDS: ${{ env.DIGEST_INTERVAL_SECONDS || '7200' }}
+        run: |
+          python bot.py --once
 
-    - name: Persist state.json to bot-data branch
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        set -euo pipefail
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Persist state.json to bot-data branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-        # Ensure state.json exists
-        if [ ! -f state.json ]; then
-          echo '{"offset": null, "last_seen": [], "last_cve_ts": 0, "subscribers": []}' > state.json
-        fi
+          if [ ! -f state.json ]; then
+            echo '{"offset": null, "last_seen": [], "last_cve_ts": 0, "subscribers": []}' > state.json
+          fi
 
-        # Create a temporary orphan branch containing only state.json, commit and push to bot-data
-        TMP_BRANCH="tmp-bot-data-$(date +%s)"
-        git checkout --orphan "$TMP_BRANCH"
-        git reset --hard
-        # remove all tracked files from index (working tree still has files); keep state.json only
-        git rm -rf . >/dev/null 2>&1 || true
+          TMP_BRANCH="tmp-bot-data-$(date +%s)"
+          git checkout --orphan "$TMP_BRANCH"
+          git reset --hard
+          git rm -rf . >/dev/null 2>&1 || true
 
-        # Move state.json to repo root if needed (it's already at root)
-        git add state.json
-        git commit -m "Update bot state [bot]" || (echo "No changes to commit" && true)
+          git add state.json
+          git commit -m "Update bot state [bot]" || echo "No changes to commit"
 
-        # Force update the bot-data branch on remote safely
-        git push --force-with-lease origin "$TMP_BRANCH:bot-data" || {
-          echo "Push to bot-data failed; printing remote refs for diagnostics"
-          git ls-remote origin bot-data || true
-        }
+          git push --force-with-lease origin "$TMP_BRANCH:bot-data" || {
+            echo "Push to bot-data failed; printing remote refs for diagnostics"
+            git ls-remote origin bot-data || true
+          }
 
-        # Return to main branch (or default branch)
-        git checkout -f --
-        # Delete temporary branch locally
-        git branch -D "$TMP_BRANCH" || true
+          git checkout -f --
+          git branch -D "$TMP_BRANCH" || true
