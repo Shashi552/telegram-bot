@@ -1,22 +1,27 @@
-name: CVE Alert Bot
+name: CVE Alert Bot (short poller -> bot-data)
 
 permissions:
   contents: write
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '*/1 * * * *'   # every minute (UTC) — adjust as needed
   workflow_dispatch:
+
+concurrency:
+  group: cve-alert-bot
+  cancel-in-progress: true
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0                # full history so we can pull/rebase safely
+        fetch-depth: 0
         persist-credentials: true
         token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -26,83 +31,69 @@ jobs:
         python-version: '3.10'
 
     - name: Install dependencies
-      run: pip install -r requirements.txt
-
-    - name: Ensure data files exist
       run: |
-        [ -f last_seen.json ] || echo "[]" > last_seen.json
-        [ -f subscribers.json ] || echo "[]" > subscribers.json
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-    - name: Run bot
+    - name: Load bot state from bot-data branch (if exists)
+      id: load_state
+      run: |
+        # If bot-data branch exists in remote, extract state.json; otherwise create default
+        if git ls-remote --exit-code --heads origin bot-data >/dev/null 2>&1; then
+          echo "bot-data exists; extracting state.json (if present)"
+          if git show origin/bot-data:state.json > state.json 2>/dev/null; then
+            echo "Loaded state.json from bot-data"
+          else
+            echo "{}" > state.json
+            echo "No state.json in bot-data; created empty state.json"
+          fi
+        else
+          echo "bot-data branch not found; creating default state.json"
+          cat > state.json <<'EOF'
+{"offset": null, "last_seen": [], "last_cve_ts": 0, "subscribers": []}
+EOF
+        fi
+        ls -l state.json
+        cat state.json || true
+
+    - name: Run bot (single-pass)
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      run: python bot.py
+        STATE_FILE: state.json
+        DIGEST_INTERVAL_SECONDS: ${{ env.DIGEST_INTERVAL_SECONDS || '7200' }}
+      run: |
+        python bot.py --once
 
-    - name: Commit updated files (fetch, reconcile, push)
+    - name: Persist state.json to bot-data branch
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
-
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
-        # Stage bot-generated files (no-op if missing)
-        git add last_seen.json subscribers.json || true
-
-        # If nothing staged, nothing to do
-        if git diff --cached --quiet; then
-          echo "No changes to commit"
-          exit 0
+        # Ensure state.json exists
+        if [ ! -f state.json ]; then
+          echo '{"offset": null, "last_seen": [], "last_cve_ts": 0, "subscribers": []}' > state.json
         fi
 
-        # Commit local changes
-        git commit -m "Update CVE and subscriber data [bot]"
+        # Create a temporary orphan branch containing only state.json, commit and push to bot-data
+        TMP_BRANCH="tmp-bot-data-$(date +%s)"
+        git checkout --orphan "$TMP_BRANCH"
+        git reset --hard
+        # remove all tracked files from index (working tree still has files); keep state.json only
+        git rm -rf . >/dev/null 2>&1 || true
 
-        # Determine current branch in a robust way
-        BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-        if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
-          # fallback to GITHUB_REF if HEAD is detached
-          BRANCH="${GITHUB_REF#refs/heads/}"
-        fi
-        echo "Branch detected: $BRANCH"
+        # Move state.json to repo root if needed (it's already at root)
+        git add state.json
+        git commit -m "Update bot state [bot]" || (echo "No changes to commit" && true)
 
-        # Ensure we have remote data
-        git fetch origin "$BRANCH" --depth=1 || git fetch origin
+        # Force update the bot-data branch on remote safely
+        git push --force-with-lease origin "$TMP_BRANCH:bot-data" || {
+          echo "Push to bot-data failed; printing remote refs for diagnostics"
+          git ls-remote origin bot-data || true
+        }
 
-        # Try to rebase local commit(s) on top of remote branch
-        if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
-          if git rebase origin/"$BRANCH"; then
-            echo "Rebase successful"
-          else
-            echo "Rebase failed — aborting rebase and trying merge"
-            git rebase --abort 2>/dev/null || true
-            # Try a non-fast-forward merge (keeps both changes)
-            if git merge --no-edit origin/"$BRANCH"; then
-              echo "Merge of origin/$BRANCH successful"
-            else
-              echo "Merge failed; continuing to push attempts"
-            fi
-          fi
-        else
-          echo "No origin/$BRANCH to rebase against (new branch), proceeding to push"
-        fi
-
-        # Try normal push first
-        if git push origin "$BRANCH"; then
-          echo "Push succeeded"
-          exit 0
-        fi
-
-        # If normal push failed due to non-fast-forward, try safe forced push
-        echo "Normal push failed; attempting safe force push (--force-with-lease)"
-        if git push --force-with-lease origin "$BRANCH"; then
-          echo "Push with --force-with-lease succeeded"
-          exit 0
-        fi
-
-        # Final fallback diagnostics (do not fail the workflow)
-        echo "Push failed; remote may contain new commits, branch protection may block pushes, or GITHUB_TOKEN lacks write permissions."
-        echo "Remote refs for branch:"
-        git ls-remote origin "$BRANCH" || true
-        exit 0
+        # Return to main branch (or default branch)
+        git checkout -f --
+        # Delete temporary branch locally
+        git branch -D "$TMP_BRANCH" || true
