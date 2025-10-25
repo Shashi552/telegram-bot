@@ -1,53 +1,91 @@
-steps:
-- name: Checkout repository
-  uses: actions/checkout@v4
-  with:
-    fetch-depth: 0                # full history so we can pull/rebase safely
-    persist-credentials: true
-    token: ${{ secrets.GITHUB_TOKEN }}
+name: CVE Alert Bot
 
-- name: Set up Python
-  uses: actions/setup-python@v5
-  with:
-    python-version: '3.10'
+permissions:
+  contents: write
 
-- name: Install dependencies
-  run: pip install -r requirements.txt
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
 
-- name: Ensure data files exist
-  run: |
-    # Make sure files exist so git add/commit behave consistently
-    [ -f last_seen.json ] || echo "[]" > last_seen.json
-    [ -f subscribers.json ] || echo "[]" > subscribers.json
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
 
-- name: Run bot
-  env:
-    TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-  run: python bot.py
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0                # full history so we can pull/rebase safely
+        persist-credentials: true
+        token: ${{ secrets.GITHUB_TOKEN }}
 
-- name: Commit updated files
-  env:
-    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  run: |
-    set -e
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
 
-    git config user.name "github-actions[bot]"
-    git config user.email "github-actions[bot]@users.noreply.github.com"
+    - name: Install dependencies
+      run: pip install -r requirements.txt
 
-    # Stage the files that the bot updates
-    git add last_seen.json subscribers.json || true
+    - name: Ensure data files exist
+      run: |
+        [ -f last_seen.json ] || echo "[]" > last_seen.json
+        [ -f subscribers.json ] || echo "[]" > subscribers.json
 
-    # Commit only if there are changes
-    git commit -m "Update CVE and subscriber data [bot]" || echo "No changes to commit"
+    - name: Run bot
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      run: python bot.py
 
-    # Derive branch name (works when running on refs/heads/*)
-    BRANCH="${GITHUB_REF#refs/heads/}"
+    - name: Commit updated files (safe merge/rebase + push)
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
 
-    # Fetch latest remote branch and rebase local commits on top.
-    # --autostash preserves local changes during rebase.
-    # Allow failures here to avoid aborting the workflow entirely; push will be attempted afterwards.
-    git pull --rebase --autostash origin "$BRANCH" || true
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
 
-    # Push local commits (if any). If push fails due to permission or non-fast-forward,
-    # print a message but don't fail the job (adjust as needed).
-    git push origin "$BRANCH" || echo "Push failed; remote may contain new commits or write permission missing"
+        # Stage bot-generated files (no-op if missing)
+        git add last_seen.json subscribers.json || true
+
+        # If nothing staged, nothing to do
+        if git diff --cached --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+
+        # Commit local changes
+        git commit -m "Update CVE and subscriber data [bot]"
+
+        # Resolve branch name (works for refs/heads/*)
+        BRANCH="${GITHUB_REF#refs/heads/}"
+
+        # Fetch remote branch and rebase local commit(s) on top.
+        # --autostash saves local changes automatically if necessary.
+        # If rebase fails due to conflicts, abort and fall back to safer operations below.
+        if ! git pull --rebase --autostash origin "$BRANCH"; then
+          echo "Rebase failed or remote has conflicting changes. Aborting rebase and attempting safer push flow."
+          git rebase --abort 2>/dev/null || true
+        fi
+
+        # Try a normal push
+        if git push origin "$BRANCH"; then
+          echo "Pushed changes successfully."
+          exit 0
+        fi
+
+        # If normal push failed (non-fast-forward), try a safe force push using --force-with-lease.
+        # This attempts to avoid stomping on changes that were pushed after the runner started.
+        if git push --force-with-lease origin "$BRANCH"; then
+          echo "Pushed changes with --force-with-lease."
+          exit 0
+        fi
+
+        # If we get here, push still failed. Print diagnostics and exit successfully
+        # to avoid failing the whole workflow while you adjust repository settings.
+        echo "Push failed; remote likely contains new commits or writing is blocked (branch protection / permissions)."
+        echo "Remote HEAD:"
+        git ls-remote origin "$BRANCH" || true
+        exit 0
