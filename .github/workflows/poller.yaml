@@ -53,9 +53,7 @@ jobs:
             fi
           else
             echo "bot-data branch not found; creating default state.json"
-            cat > state.json <<'EOF'
-{"offset": null, "last_seen": [], "last_cve_ts": 0, "subscribers": []}
-EOF
+            echo '{"offset": null, "last_seen": [], "last_cve_ts": 0, "subscribers": []}' > state.json
           fi
           ls -l state.json
           cat state.json || true
