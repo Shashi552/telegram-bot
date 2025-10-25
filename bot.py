@@ -81,8 +81,17 @@ def main():
     subscribers = handle_start_commands(subscribers)
 
     latest_cves = fetch_latest_cves()
-    new_cves = [cve for cve in latest_cves if cve["id"] not in last_seen]
+   # Compare with last seen CVEs
+new_cves = []
+for cve in latest_cves:
+    cve_id = cve.get("id") or cve.get("cve", {}).get("id") or cve.get("cve", {}).get("CVE_data_meta", {}).get("ID")
+    if not cve_id:
+        print(f"[WARN] Skipping malformed CVE entry: {cve}")
+        continue
+    if cve_id not in last_seen:
+        new_cves.append({"id": cve_id, "description": cve.get("description", "No description available")})
 
+print(f"[INFO] Found {len(new_cves)} new CVEs to send.")
     if new_cves:
         for cve in new_cves:
             message = format_cve_message(cve)
@@ -98,3 +107,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
