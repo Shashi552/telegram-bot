@@ -1,40 +1,57 @@
+#!/usr/bin/env python3
+# bot.py
+# Reference: use with workflow ref fa5e664968f37dfe4759bace0fd7152b7fc27307
 from __future__ import annotations
 import os
-import re
+import sys
+import time
 import json
-import requests
+import re
+import argparse
 import logging
 from typing import Any, Dict, List, Optional
+import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Config
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}" if TELEGRAM_TOKEN else ""
 CVE_FEED = os.environ.get("CVE_FEED", "https://cve.circl.lu/api/last")
-CVE_LOOKUP = os.environ.get("CVE_LOOKUP", "https://cve.circl.lu/api/cve")  # append /{CVE_ID}
-LAST_SEEN_FILE = os.environ.get("LAST_SEEN_FILE", "last_seen.json")
-SUBSCRIBERS_FILE = os.environ.get("SUBSCRIBERS_FILE", "subscribers.json")
+CVE_LOOKUP = os.environ.get("CVE_LOOKUP", "https://cve.circl.lu/api/cve")
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")
+
+# digest interval in seconds (default 2 hours)
+DIGEST_INTERVAL = int(os.environ.get("DIGEST_INTERVAL_SECONDS", 2 * 60 * 60))
 
 CVE_ID_RE = re.compile(r"\bCVE-\d{4}-\d+\b", flags=re.IGNORECASE)
 
 
-def load_json(path: str, default: Any) -> Any:
+def load_state(path: str) -> Dict[str, Any]:
+    default = {"offset": None, "last_seen": [], "last_cve_ts": 0, "subscribers": []}
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as fh:
-                return json.load(fh)
+                data = json.load(fh)
+                if not isinstance(data, dict):
+                    return default
+                # normalize keys
+                return {
+                    "offset": data.get("offset"),
+                    "last_seen": data.get("last_seen", []) if isinstance(data.get("last_seen", []), list) else [],
+                    "last_cve_ts": int(data.get("last_cve_ts", 0)) if data.get("last_cve_ts", 0) is not None else 0,
+                    "subscribers": data.get("subscribers", []) if isinstance(data.get("subscribers", []), list) else [],
+                }
     except Exception as e:
-        logging.warning("Failed to load %s: %s", path, e)
+        logging.warning("Failed to load state %s: %s", path, e)
     return default
 
 
-def save_json(path: str, data: Any) -> None:
+def save_state(path: str, data: Dict[str, Any]) -> None:
     try:
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
     except Exception as e:
-        logging.error("Failed to write %s: %s", path, e)
+        logging.error("Failed to write state to %s: %s", path, e)
 
 
 def ref_to_str(ref: Any) -> str:
@@ -59,120 +76,39 @@ def ref_to_str(ref: Any) -> str:
     return str(ref)
 
 
-def extract_cve_id(cve: Dict[str, Any]) -> Optional[str]:
-    if not isinstance(cve, dict):
-        return None
-    for key in ("id", "ID"):
-        if key in cve and isinstance(cve[key], str):
-            return cve[key]
-    nested = cve.get("cve", {})
-    if isinstance(nested, dict):
-        if "id" in nested and isinstance(nested["id"], str):
-            return nested["id"]
-        meta = nested.get("CVE_data_meta", {})
-        if isinstance(meta, dict):
-            cid = meta.get("ID") or meta.get("id")
-            if isinstance(cid, str):
-                return cid
-    return None
-
-
-# --- TELEGRAM HELPERS ---
-def send_message(chat_id: int, text: str) -> None:
+def send_message(chat_id: int, text: str) -> bool:
     if not TELEGRAM_TOKEN:
         logging.error("TELEGRAM_TOKEN not set; cannot send messages.")
-        return
+        return False
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     try:
         resp = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
-        logging.info("sendMessage to %s status=%s", chat_id, resp.status_code)
+        logging.info("sendMessage chat=%s status=%s", chat_id, resp.status_code)
         if resp.status_code != 200:
-            logging.error("Failed to send message to %s: %s", chat_id, resp.text)
+            logging.error("sendMessage failed: %s", resp.text)
+            return False
+        return True
     except Exception as e:
         logging.error("Error sending message to %s: %s", chat_id, e)
+        return False
 
 
-def get_updates(offset: Optional[int] = None, timeout: int = 10) -> List[Dict[str, Any]]:
+def get_updates(offset: Optional[int] = None, timeout: int = 5) -> List[Dict[str, Any]]:
     if not TELEGRAM_TOKEN:
         logging.warning("TELEGRAM_TOKEN not set; skipping getUpdates.")
         return []
-    params = {"offset": offset, "timeout": timeout}
+    params = {"timeout": timeout}
+    if offset is not None:
+        params["offset"] = offset
     try:
-        resp = requests.get(f"{BASE_URL}/getUpdates", params=params, timeout=20)
-        logging.debug("getUpdates status=%s", resp.status_code)
+        resp = requests.get(f"{BASE_URL}/getUpdates", params=params, timeout=timeout + 5)
         data = resp.json()
         return data.get("result", [])
     except Exception as e:
-        logging.warning("get_updates error: %s", e)
+        logging.warning("getUpdates error: %s", e)
     return []
 
 
-# Process incoming updates: /start, /stop, and direct CVE queries
-def process_updates(subscribers: List[int]) -> List[int]:
-    logging.info("Checking Telegram updates for commands/messages...")
-    last_update_id = None
-    updates = get_updates()
-    logging.info("Received %d updates", len(updates))
-    for update in updates:
-        last_update_id = update.get("update_id")
-        logging.debug("Update: %s", update)
-        message = update.get("message", {}) or update.get("edited_message", {}) or {}
-        text = message.get("text", "") or ""
-        chat = message.get("chat", {})
-        chat_id = chat.get("id")
-
-        if not chat_id:
-            continue
-
-        text = text.strip()
-
-        # /start: subscribe the user
-        if text == "/start":
-            if chat_id not in subscribers:
-                subscribers.append(chat_id)
-                save_json(SUBSCRIBERS_FILE, subscribers)
-                send_message(chat_id, "✅ You have been subscribed to CVE alerts! You'll get new vulnerabilities every 2 hours.")
-                logging.info("Subscribed chat_id %s", chat_id)
-            else:
-                send_message(chat_id, "You are already subscribed to CVE alerts.")
-            continue
-
-        # /stop: unsubscribe the user
-        if text == "/stop":
-            if chat_id in subscribers:
-                subscribers.remove(chat_id)
-                save_json(SUBSCRIBERS_FILE, subscribers)
-                send_message(chat_id, "🛑 You have been unsubscribed from CVE alerts. Send /start to subscribe again.")
-                logging.info("Unsubscribed chat_id %s", chat_id)
-            else:
-                send_message(chat_id, "You are not currently subscribed.")
-            continue
-
-        # If the message contains a CVE id, respond with details
-        match = CVE_ID_RE.search(text)
-        if match:
-            cve_id = match.group(0).upper()
-            logging.info("User %s requested details for %s", chat_id, cve_id)
-            cve = fetch_cve_by_id(cve_id)
-            if cve:
-                msg = format_cve_message(cve)
-                send_message(chat_id, msg)
-            else:
-                send_message(chat_id, f"No details found for {cve_id}.")
-            continue
-
-    # Acknowledge processed updates by advancing offset so Telegram won't resend
-    if last_update_id:
-        try:
-            requests.get(f"{BASE_URL}/getUpdates", params={"offset": last_update_id + 1}, timeout=5)
-            logging.info("Acknowledged updates up to id %s", last_update_id)
-        except Exception:
-            pass
-
-    return subscribers
-
-
-# --- CVE fetch & formatting ---
 def fetch_latest_cves() -> List[Dict[str, Any]]:
     try:
         resp = requests.get(CVE_FEED, timeout=30)
@@ -190,32 +126,38 @@ def fetch_latest_cves() -> List[Dict[str, Any]]:
 
 
 def fetch_cve_by_id(cve_id: str) -> Optional[Dict[str, Any]]:
-    # Try the cve.circl.lu API first
     try:
-        url = f"{CVE_LOOKUP}/{cve_id}"
-        resp = requests.get(url, timeout=20)
+        resp = requests.get(f"{CVE_LOOKUP}/{cve_id}", timeout=20)
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, dict) and data:
                 return data
     except Exception as e:
-        logging.warning("fetch_cve_by_id error using %s: %s", CVE_LOOKUP, e)
-    # Could add other lookup sources if desired
+        logging.warning("fetch_cve_by_id error: %s", e)
+    return None
+
+
+def extract_cve_id(cve: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(cve, dict):
+        return None
+    for key in ("id", "ID", "Name", "CVE"):
+        v = cve.get(key)
+        if isinstance(v, str):
+            return v
+    nested = cve.get("cve", {})
+    if isinstance(nested, dict):
+        if "id" in nested and isinstance(nested["id"], str):
+            return nested["id"]
+        meta = nested.get("CVE_data_meta", {})
+        if isinstance(meta, dict):
+            cid = meta.get("ID") or meta.get("id")
+            if isinstance(cid, str):
+                return cid
     return None
 
 
 def format_cve_message(cve: Dict[str, Any]) -> str:
-    # The feed and lookup may have different schemas; handle common possibilities
-    cve_id = (
-        cve.get("id")
-        or cve.get("Name")
-        or cve.get("CVE")
-        or (cve.get("cve", {}) or {}).get("id")
-        or extract_cve_id(cve)
-        or "UNKNOWN"
-    )
-    cve_id = str(cve_id)
-
+    cve_id = str(extract_cve_id(cve) or cve.get("id") or "UNKNOWN")
     summary = (
         cve.get("summary")
         or cve.get("description")
@@ -223,19 +165,14 @@ def format_cve_message(cve: Dict[str, Any]) -> str:
         or cve.get("details")
         or "No description available."
     )
-
     published = cve.get("Published") or cve.get("published") or cve.get("PublishedDate") or "Unknown date"
-
-    cvss = cve.get("cvss") or cve.get("cvss3") or cve.get("cvss_v3") or cve.get("cvss-score") or "N/A"
-
-    references_raw = cve.get("references") or cve.get("refs") or cve.get("references_data") or cve.get("References") or []
+    cvss = cve.get("cvss") or cve.get("cvss_v3") or "N/A"
+    references_raw = cve.get("references") or cve.get("refs") or cve.get("References") or []
     if not isinstance(references_raw, list):
         references_raw = [references_raw]
-
     reference_strs = [ref_to_str(r) for r in references_raw if r]
     ref_texts = [r for r in reference_strs if r]
     ref_text = "\n".join(ref_texts[:3]) if ref_texts else "No references available."
-
     msg = (
         f"🚨 *CVE Details*\n\n"
         f"*ID:* `{cve_id}`\n"
@@ -248,56 +185,122 @@ def format_cve_message(cve: Dict[str, Any]) -> str:
     return msg
 
 
-# --- MAIN LOGIC ---
-def main() -> None:
-    last_seen = load_json(LAST_SEEN_FILE, [])
-    if not isinstance(last_seen, list):
-        last_seen = []
+def process_updates_once(state: Dict[str, Any]) -> Dict[str, Any]:
+    offset = state.get("offset")
+    subscribers = state.get("subscribers", [])
+    updates = get_updates(offset=offset, timeout=5)
+    last_update_id = offset
+    if updates:
+        logging.info("Processing %d updates", len(updates))
+    for u in updates:
+        last_update_id = u.get("update_id", last_update_id)
+        message = u.get("message") or u.get("edited_message") or {}
+        text = (message.get("text") or "").strip()
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        if not chat_id:
+            continue
+        # commands
+        if text == "/start":
+            if chat_id not in subscribers:
+                subscribers.append(chat_id)
+                send_message(chat_id, "✅ You have been subscribed to CVE alerts! You'll get new vulnerabilities every 2 hours.")
+                logging.info("Subscribed %s", chat_id)
+            else:
+                send_message(chat_id, "You are already subscribed to CVE alerts.")
+            continue
+        if text == "/stop":
+            if chat_id in subscribers:
+                subscribers.remove(chat_id)
+                send_message(chat_id, "🛑 You have been unsubscribed. Send /start to subscribe again.")
+                logging.info("Unsubscribed %s", chat_id)
+            else:
+                send_message(chat_id, "You are not currently subscribed.")
+            continue
+        # CVE query immediate reply
+        m = CVE_ID_RE.search(text)
+        if m:
+            cve_id = m.group(0).upper()
+            logging.info("CVE query from %s for %s", chat_id, cve_id)
+            cve = fetch_cve_by_id(cve_id)
+            if cve:
+                send_message(chat_id, format_cve_message(cve))
+            else:
+                send_message(chat_id, f"No details found for {cve_id}.")
+            continue
+    # update offset
+    if last_update_id is not None:
+        state["offset"] = last_update_id + 1
+    state["subscribers"] = subscribers
+    return state
 
-    subscribers = load_json(SUBSCRIBERS_FILE, [])
-    if not isinstance(subscribers, list):
-        subscribers = []
 
-    # Process Telegram updates (handles /start, /stop, and direct CVE queries)
-    subscribers = process_updates(subscribers)
-    save_json(SUBSCRIBERS_FILE, subscribers)
-
-    # Fetch latest CVEs and notify subscribers about new ones
+def maybe_send_digest(state: Dict[str, Any]) -> Dict[str, Any]:
+    now = int(time.time())
+    last_ts = int(state.get("last_cve_ts", 0) or 0)
+    if now - last_ts < DIGEST_INTERVAL:
+        logging.debug("Digest not due yet (elapsed %s < %s)", now - last_ts, DIGEST_INTERVAL)
+        return state
+    logging.info("Digest due: fetching CVE feed")
     latest_cves = fetch_latest_cves()
     if not latest_cves:
-        logging.info("No CVEs fetched.")
-        return
-
-    new_cves: List[Dict[str, Any]] = []
+        logging.info("No CVEs retrieved")
+        return state
+    last_seen = state.get("last_seen", [])
+    new_cves = []
     for cve in latest_cves:
-        cve_id = extract_cve_id(cve) or cve.get("id")
-        if not cve_id:
-            logging.warning("Skipping malformed CVE entry: %s", cve)
+        cid = extract_cve_id(cve) or cve.get("id")
+        if not cid:
             continue
-        if cve_id not in last_seen:
+        if cid not in last_seen:
             new_cves.append(cve)
-
-    logging.info("Found %d new CVEs to send.", len(new_cves))
-
-    if new_cves:
+    logging.info("Found %d new CVEs to send", len(new_cves))
+    subscribers = state.get("subscribers", [])
+    if new_cves and subscribers:
         for cve in new_cves:
-            message = format_cve_message(cve)
+            msg = format_cve_message(cve)
             for chat_id in subscribers:
-                try:
-                    send_message(chat_id, message)
-                except Exception as e:
-                    logging.error("Failed to send CVE to %s: %s", chat_id, e)
+                send_message(chat_id, msg)
+    # update last_seen to the most recent 50 ids
+    updated_ids = []
+    for cve in latest_cves:
+        cid = extract_cve_id(cve) or cve.get("id")
+        if cid:
+            updated_ids.append(cid)
+        if len(updated_ids) >= 50:
+            break
+    state["last_seen"] = updated_ids
+    state["last_cve_ts"] = now
+    return state
 
-        # Update last_seen to the most recent 50 ids from latest_cves in order
-        updated_ids: List[str] = []
-        for cve in latest_cves:
-            cid = extract_cve_id(cve) or cve.get("id")
-            if cid:
-                updated_ids.append(cid)
-            if len(updated_ids) >= 50:
-                break
-        save_json(LAST_SEEN_FILE, updated_ids)
-        logging.info("Updated last_seen with %d IDs.", len(updated_ids))
+
+def main_once(state_file: str) -> int:
+    state = load_state(state_file)
+    state = process_updates_once(state)
+    state = maybe_send_digest(state)
+    save_state(state_file, state)
+    logging.info("Run complete")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true", help="Process updates once and exit (for CI/cron)")
+    args = parser.parse_args()
+    if not TELEGRAM_TOKEN:
+        logging.error("TELEGRAM_TOKEN not set. Exiting.")
+        sys.exit(1)
+    if args.once:
+        sys.exit(main_once(STATE_FILE))
+    else:
+        # fallback: short loop mode for local testing
+        logging.info("Running in short-loop mode (not recommended in Actions). Use --once for CI.")
+        try:
+            while True:
+                main_once(STATE_FILE)
+                time.sleep(10)
+        except KeyboardInterrupt:
+            logging.info("Interrupted, exiting")
 
 
 if __name__ == "__main__":
