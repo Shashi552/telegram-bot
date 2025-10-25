@@ -12,6 +12,9 @@ concurrency:
   group: cve-alert-bot
   cancel-in-progress: true
 
+env:
+  DIGEST_INTERVAL_SECONDS: '7200'  # default fallback interval (2 hours)
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -32,11 +35,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
       - name: Load bot state from bot-data branch (if exists)
         id: load_state
         run: |
+          # If bot-data branch exists in remote, extract state.json; otherwise create default
           if git ls-remote --exit-code --heads origin bot-data >/dev/null 2>&1; then
             echo "bot-data exists; extracting state.json (if present)"
             if git show origin/bot-data:state.json > state.json 2>/dev/null; then
@@ -58,9 +64,11 @@ EOF
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           STATE_FILE: state.json
-          DIGEST_INTERVAL_SECONDS: ${{ env.DIGEST_INTERVAL_SECONDS || '7200' }}
+          DIGEST_INTERVAL_SECONDS: ${{ env.DIGEST_INTERVAL_SECONDS }}
         run: |
+          echo "Starting CVE Alert Bot..."
           python bot.py --once
+          echo "Bot run completed."
 
       - name: Persist state.json to bot-data branch
         env:
@@ -70,10 +78,12 @@ EOF
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Ensure state.json exists
           if [ ! -f state.json ]; then
             echo '{"offset": null, "last_seen": [], "last_cve_ts": 0, "subscribers": []}' > state.json
           fi
 
+          # Create a temporary orphan branch containing only state.json, commit and push to bot-data
           TMP_BRANCH="tmp-bot-data-$(date +%s)"
           git checkout --orphan "$TMP_BRANCH"
           git reset --hard
