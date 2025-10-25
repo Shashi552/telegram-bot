@@ -38,7 +38,7 @@ jobs:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       run: python bot.py
 
-    - name: Commit updated files (safe merge/rebase + push)
+    - name: Commit updated files (fetch, reconcile, push)
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
@@ -59,33 +59,50 @@ jobs:
         # Commit local changes
         git commit -m "Update CVE and subscriber data [bot]"
 
-        # Resolve branch name (works for refs/heads/*)
-        BRANCH="${GITHUB_REF#refs/heads/}"
+        # Determine current branch in a robust way
+        BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+        if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
+          # fallback to GITHUB_REF if HEAD is detached
+          BRANCH="${GITHUB_REF#refs/heads/}"
+        fi
+        echo "Branch detected: $BRANCH"
 
-        # Fetch remote branch and rebase local commit(s) on top.
-        # --autostash saves local changes automatically if necessary.
-        # If rebase fails due to conflicts, abort and fall back to safer operations below.
-        if ! git pull --rebase --autostash origin "$BRANCH"; then
-          echo "Rebase failed or remote has conflicting changes. Aborting rebase and attempting safer push flow."
-          git rebase --abort 2>/dev/null || true
+        # Ensure we have remote data
+        git fetch origin "$BRANCH" --depth=1 || git fetch origin
+
+        # Try to rebase local commit(s) on top of remote branch
+        if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+          if git rebase origin/"$BRANCH"; then
+            echo "Rebase successful"
+          else
+            echo "Rebase failed — aborting rebase and trying merge"
+            git rebase --abort 2>/dev/null || true
+            # Try a non-fast-forward merge (keeps both changes)
+            if git merge --no-edit origin/"$BRANCH"; then
+              echo "Merge of origin/$BRANCH successful"
+            else
+              echo "Merge failed; continuing to push attempts"
+            fi
+          fi
+        else
+          echo "No origin/$BRANCH to rebase against (new branch), proceeding to push"
         fi
 
-        # Try a normal push
+        # Try normal push first
         if git push origin "$BRANCH"; then
-          echo "Pushed changes successfully."
+          echo "Push succeeded"
           exit 0
         fi
 
-        # If normal push failed (non-fast-forward), try a safe force push using --force-with-lease.
-        # This attempts to avoid stomping on changes that were pushed after the runner started.
+        # If normal push failed due to non-fast-forward, try safe forced push
+        echo "Normal push failed; attempting safe force push (--force-with-lease)"
         if git push --force-with-lease origin "$BRANCH"; then
-          echo "Pushed changes with --force-with-lease."
+          echo "Push with --force-with-lease succeeded"
           exit 0
         fi
 
-        # If we get here, push still failed. Print diagnostics and exit successfully
-        # to avoid failing the whole workflow while you adjust repository settings.
-        echo "Push failed; remote likely contains new commits or writing is blocked (branch protection / permissions)."
-        echo "Remote HEAD:"
+        # Final fallback diagnostics (do not fail the workflow)
+        echo "Push failed; remote may contain new commits, branch protection may block pushes, or GITHUB_TOKEN lacks write permissions."
+        echo "Remote refs for branch:"
         git ls-remote origin "$BRANCH" || true
         exit 0
