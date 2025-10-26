@@ -1,11 +1,11 @@
-name: CVE Alert Bot (short poller -> bot-data)
+name: CVE Alert Bot (2-hour poller -> bot-data)
 
 permissions:
   contents: write
 
 on:
   schedule:
-    - cron: '*/1 * * * *'   # every minute (UTC)
+    - cron: '0 */2 * * *'   # every 2 hours (UTC)
   workflow_dispatch:
 
 concurrency:
@@ -42,7 +42,6 @@ jobs:
       - name: Load bot state from bot-data branch (if exists)
         id: load_state
         run: |
-          # If bot-data branch exists in remote, extract state.json; otherwise create default
           if git ls-remote --exit-code --heads origin bot-data >/dev/null 2>&1; then
             echo "bot-data exists; extracting state.json (if present)"
             if git show origin/bot-data:state.json > state.json 2>/dev/null; then
@@ -76,12 +75,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Ensure state.json exists
           if [ ! -f state.json ]; then
             echo '{"offset": null, "last_seen": [], "last_cve_ts": 0, "subscribers": []}' > state.json
           fi
 
-          # Create a temporary orphan branch containing only state.json, commit and push to bot-data
           TMP_BRANCH="tmp-bot-data-$(date +%s)"
           git checkout --orphan "$TMP_BRANCH"
           git reset --hard
